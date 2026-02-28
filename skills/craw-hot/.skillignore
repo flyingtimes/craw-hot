@@ -1,0 +1,22 @@
+# 排除运行时生成的文件
+*.log
+results/
+users.txt
+
+# 排除 Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 排除测试文件
+test_*.py
+
+# 排除编辑器文件
+.DS_Store
+*.swp
+*.swo
+*~
+
+# 排除打包文件
+*.skill
