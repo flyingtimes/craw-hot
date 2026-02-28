@@ -1,0 +1,3 @@
+# X Timeline Daily Summary - 每天早上 6 点执行
+# 格式：分 时 日 月 星期 命令
+0 6 * * * /Users/clark/clawd/scripts/x-timeline-summary.sh >> /Users/clark/clawd/logs/x-daily.log 2>&1
