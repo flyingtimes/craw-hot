@@ -43,8 +43,9 @@ class Config:
     page_load_timeout: int = 5
     scroll_check_interval: float = 0.5
     scroll_max_attempts: int = 10
-    scroll_no_new_threshold: int = 3  # 连续 N 次没新帖就停止
+    scroll_no_new_threshold: int = 2  # 连续 2 次没新帖就停止（优化：从 3 次降为 2 次）
     scroll_max_consecutive_errors: int = 3
+    scroll_early_stop_on_yesterday: bool = True  # 检测到昨天的帖子就立即停止
     user_crawl_timeout: int = 120  # 2 分钟
 
     # 重试配置
@@ -192,20 +193,38 @@ class BrowserClient:
         """解析浏览器命令输出（支持 JSON、布尔值）"""
         lines = output.strip().split('\n')
 
-        # 从后往前找有效行
-        for line in reversed(lines):
-            line = line.strip()
+        # 从前往后找 JSON 开始（{, [, "）
+        json_start = None
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+
+            # 跳过调试信息（以 │, ├, ╯, ◇ 等开头的行）
+            if line_stripped.startswith(('│', '├', '╯', '◇')):
+                continue
+
+            # 找到 JSON 开始
+            if line_stripped and (line_stripped.startswith('{') or line_stripped.startswith('"') or line_stripped.startswith('[')):
+                json_start = i
+                break
 
             # 处理布尔值
-            if line == "true":
+            if line_stripped == "true":
                 return {"ok": True, "result": True}
-            if line == "false":
+            if line_stripped == "false":
                 return {"ok": True, "result": False}
 
-            # 处理 JSON
-            if line and (line.startswith('{') or line.startswith('"') or line.startswith('[')):
+            # 处理数字（新增）
+            if line_stripped.lstrip('-').isdigit():
+                return {"ok": True, "result": int(line_stripped)}
+
+        if json_start is not None:
+            # 从 JSON 开始行合并后续行直到找到完整的 JSON
+            json_text = lines[json_start]
+
+            for j in range(json_start + 1, len(lines)):
+                json_text += '\n' + lines[j]
                 try:
-                    response = json.loads(line)
+                    response = json.loads(json_text)
                     if isinstance(response, str):
                         return {"ok": True, "result": response}
                     elif isinstance(response, dict):
@@ -216,10 +235,27 @@ class BrowserClient:
                     else:
                         return {"ok": True, "result": response}
                 except json.JSONDecodeError:
+                    # JSON 还不完整，继续合并
                     continue
 
+            # 循环结束后，再次尝试解析（处理单行 JSON 的情况）
+            try:
+                response = json.loads(json_text)
+                if isinstance(response, str):
+                    return {"ok": True, "result": response}
+                elif isinstance(response, dict):
+                    if response.get("ok"):
+                        return response
+                    else:
+                        return {"ok": True, "result": response.get("result")}
+                else:
+                    return {"ok": True, "result": response}
+            except json.JSONDecodeError:
+                # 合并了所有行还是无法解析
+                self.logger.warning(f"Failed to parse JSON: {json_text[:100]}")
+
         # 没有找到有效输出
-        self.logger.debug(f"Cannot find valid output in: {output[-100:]}")
+        self.logger.debug(f"Cannot find valid output. Lines: {lines[:10]}")  # 显示前 10 行用于调试
         return None
 
     def _check_tab_not_found(self, result: subprocess.CompletedProcess) -> bool:
@@ -315,17 +351,51 @@ class BrowserClient:
         self.logger.info(f"Navigating to {url}")
         result = self._execute_action(
             action="navigate",
-            cmd=["openclaw", "browser", "navigate", url]
+            cmd=["openclaw", "browser", "navigate", "--json", url]
         )
-        return result is not None
+        if result:
+            self.target_id = result.get("targetId")
+            return True
+        return False
 
     def evaluate(self, js_code: str) -> Optional[Any]:
         """执行 JavaScript"""
+        if not self.target_id:
+            self.logger.warning("No targetId available, cannot evaluate")
+            return None
+
         result = self._execute_action(
             action="evaluate",
-            cmd=["openclaw", "browser", "evaluate", "--fn", js_code]
+            cmd=["openclaw", "browser", "evaluate", "--target-id", self.target_id, "--fn", js_code]
         )
-        return result.get("result") if result else None
+
+        if not result:
+            return None
+
+        result_value = result.get("result")
+        self.logger.debug(f"Evaluate result type: {type(result_value)}")
+        self.logger.debug(f"Evaluate result (repr): {repr(result_value)[:200]}")
+
+        # 修复：openclaw browser evaluate 返回的 JSON 被双重转义
+        # _parse_output 可能已经解析了一次，如果结果是列表，直接返回
+        if isinstance(result_value, list):
+            self.logger.debug(f"Result is already a list: {len(result_value)} items")
+            return result_value
+
+        # 如果是字符串且以 [ 或 { 开头，尝试解析
+        if isinstance(result_value, str) and result_value.strip().startswith(('[', '{')):
+            try:
+                result_value = json.loads(result_value)
+                self.logger.debug(f"Parsed evaluate result: string -> {type(result_value)}")
+                # 解析后可能还是字符串（双重转义）
+                if isinstance(result_value, str) and result_value.strip().startswith(('[', '{')):
+                    result_value = json.loads(result_value)
+                    self.logger.debug(f"Double-parsed evaluate result: string -> {type(result_value)}")
+            except json.JSONDecodeError as e:
+                self.logger.warning(f"Failed to parse evaluate result: {e}")
+                return None
+
+        return result_value
 
     def press(self, key: str) -> bool:
         """按键"""
@@ -337,7 +407,7 @@ class BrowserClient:
 
     def wait_for_content_loaded(self, timeout: int) -> bool:
         """智能等待：检查页面是否真的加载完成"""
-        js_code = "return document.querySelectorAll('article').length > 0;"
+        js_code = "document.querySelectorAll('article').length > 0"
 
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -610,41 +680,40 @@ class PostCrawler:
 
     def _get_scroll_js(self) -> str:
         """获取滚动的 JavaScript 代码"""
+        # 使用 IIFE 立即执行并返回结果（箭头函数隐式返回）
         return """(() => {
             const articles = document.querySelectorAll('article');
             const now = new Date();
             const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
             const result = [];
 
-            articles.forEach(article => {
-                try {
-                    const timeElement = article.querySelector('time');
-                    if (!timeElement) return;
+            for (let i = 0; i < articles.length; i++) {
+                const article = articles[i];
+                const timeElement = article.querySelector('time');
+                if (!timeElement) continue;
 
-                    const datetime = timeElement.getAttribute('datetime');
-                    if (!datetime) return;
+                const datetime = timeElement.getAttribute('datetime');
+                if (!datetime) continue;
 
-                    const tweetDate = new Date(datetime);
-                    if (tweetDate < oneDayAgo) return;
+                const tweetDate = new Date(datetime);
+                if (tweetDate < oneDayAgo) continue;
 
-                    const links = article.querySelectorAll('a[href*="/status/"]');
-                    for (const link of links) {
-                        const href = link.getAttribute('href');
-                        if (href && href.includes('/status/')) {
-                            const statusId = href.split('/status/')[1].split('/')[0];
-                            const fullUrl = 'https://x.com' + href.split('/status/')[0] + '/status/' + statusId;
-                            if (!result.includes(fullUrl)) {
-                                result.push(fullUrl);
-                            }
-                            break;
+                const links = article.querySelectorAll('a[href*="/status/"]');
+                for (let j = 0; j < links.length; j++) {
+                    const link = links[j];
+                    const href = link.getAttribute('href');
+                    if (href && href.includes('/status/')) {
+                        const statusId = href.split('/status/')[1].split('/')[0];
+                        const fullUrl = 'https://x.com' + href.split('/status/')[0] + '/status/' + statusId;
+                        if (!result.includes(fullUrl)) {
+                            result.push(fullUrl);
                         }
+                        break;
                     }
-                } catch (e) {
-                    // Skip this article
                 }
-            });
+            }
 
-            return JSON.stringify(result);
+            return result
         })()"""
 
     def crawl_user(self, username: str) -> List[str]:
@@ -677,6 +746,7 @@ class PostCrawler:
         seen_ids = set()
         no_new_count = 0
         consecutive_errors = 0
+        found_yesterday = False  # 检测是否找到昨天的帖子
 
         for scroll_num in range(1, self.config.scroll_max_attempts + 1):
             self.logger.debug(f"Scroll {scroll_num}/{self.config.scroll_max_attempts}")
@@ -688,7 +758,11 @@ class PostCrawler:
             if result is not None:
                 consecutive_errors = 0
                 try:
-                    page_urls = json.loads(result)
+                    # result 可能已经是列表，或者需要 json.loads 解析
+                    if isinstance(result, list):
+                        page_urls = result
+                    else:
+                        page_urls = json.loads(result)
                     new_urls = [u for u in page_urls if u not in seen_ids]
 
                     if new_urls:
@@ -700,9 +774,30 @@ class PostCrawler:
                         no_new_count += 1
                         self.logger.debug(f"No new posts (count: {no_new_count})")
 
+                        # 优化：连续 2 次无新帖就停止（原为 3 次）
                         if no_new_count >= self.config.scroll_no_new_threshold:
-                            self.logger.info("No new posts for 3 scrolls, stopping early")
+                            self.logger.info("No new posts for 2 scrolls, stopping early")
                             break
+
+                        # 优化：如果配置了，检测到昨天的帖子就立即停止
+                        # 通过观察第一个帖子的 URL 中的时间戳判断是否是昨天的
+                        if self.config.scroll_early_stop_on_yesterday and scroll_num == 1 and urls:
+                            first_url = urls[0]
+                            # 从 URL 中提取 tweet ID，判断时间
+                            # 格式：https://x.com/username/status/1234567890
+                            tweet_id = first_url.split('/status/')[-1]
+                            if tweet_id:
+                                tweet_timestamp = int(tweet_id)
+                                # Twitter 的 Snowflake ID 中，时间戳是前 41 位
+                                # 当前时间戳（毫秒）转换为秒
+                                import time as time_module
+                                current_ts = time_module.time() * 1000
+                                # 计算 24 小时前的时间戳
+                                one_day_ago = current_ts - (24 * 60 * 60 * 1000)
+                                if tweet_timestamp < one_day_ago:
+                                    self.logger.info("Detected yesterday's post, stopping immediately")
+                                    found_yesterday = True
+                                    break
                 except json.JSONDecodeError as e:
                     self.logger.error(f"Failed to parse URLs: {str(e)}")
                     consecutive_errors += 1
@@ -712,6 +807,10 @@ class PostCrawler:
             # 检查是否需要放弃
             if consecutive_errors >= self.config.scroll_max_consecutive_errors:
                 self.logger.error(f"Too many consecutive errors, giving up on @{username}")
+                break
+
+            # 优化：如果已经检测到昨天的帖子，立即停止
+            if found_yesterday:
                 break
 
             # 滚动
